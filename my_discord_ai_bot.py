@@ -1,8 +1,8 @@
 """
 Discord AI Assistant for a Discord Community
 
-A Discord bot that uses Ollama/LLM API to provide AI-powered responses
-when mentioned in chat.
+A Discord bot that uses local LLM API (Ollama) or OpenAI ChatGPT API 
+to provide AI-powered responses when mentioned in chat.
 """
 
 import os
@@ -30,14 +30,26 @@ TYPING_TIMEOUT = 30  # seconds
 
 # LLM configuration defaults
 DEFAULT_OLLAMA_URL = "http://localhost:11434/api/chat"
+DEFAULT_OPENAI_URL = "https://api.openai.com/v1/chat/completions"
 DEFAULT_MODEL = "llama3.1:8b"
+DEFAULT_OPENAI_MODEL = "gpt-3.5-turbo"
 DEFAULT_TEMPERATURE = 0.7
 DEFAULT_MAX_TOKENS = 120
+
+# API provider types
+API_PROVIDER_OLLAMA = "ollama"
+API_PROVIDER_OPENAI = "openai"
+API_PROVIDER_FALLBACK = "fallback"
+
+# Timeout settings (in seconds)
+LOCAL_LLM_TIMEOUT = 5   # Short timeout for local LLM since it should be fast
+REMOTE_API_TIMEOUT = 30 # Longer timeout for remote APIs like OpenAI
 
 # Error messages (will be formatted with bot name)
 ERROR_MESSAGE_TEMPLATE = "⚠️ {} had a hiccup, try again!"
 GREETING_MESSAGE = "Hey there! 🤖 What can I help you with?"
 STARTUP_MESSAGE_TEMPLATE = "✅ {} logged in as {}"
+FALLBACK_MESSAGE_TEMPLATE = "⚠️ Local LLM unavailable, using OpenAI fallback"
 
 # =============================================================================
 # INITIALIZATION
@@ -85,8 +97,29 @@ load_environment_variables()
 
 # Load configuration from environment
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+API_PROVIDER = os.getenv("API_PROVIDER", API_PROVIDER_FALLBACK).lower()
 OLLAMA_URL = os.getenv("OLLAMA_URL", DEFAULT_OLLAMA_URL)
-MODEL = os.getenv("MODEL", DEFAULT_MODEL)
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_URL = os.getenv("OPENAI_URL", DEFAULT_OPENAI_URL)
+
+# Fallback configuration
+ENABLE_FALLBACK = os.getenv("ENABLE_FALLBACK", "true").lower() in ("true", "1", "yes")
+
+# Set default models for each provider
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", DEFAULT_MODEL)
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", DEFAULT_OPENAI_MODEL)
+
+# Set primary model based on provider
+if API_PROVIDER == API_PROVIDER_OPENAI:
+    MODEL = OPENAI_MODEL
+    API_URL = OPENAI_URL
+elif API_PROVIDER == API_PROVIDER_OLLAMA:
+    MODEL = OLLAMA_MODEL
+    API_URL = OLLAMA_URL
+else:  # fallback mode
+    MODEL = OLLAMA_MODEL  # Try Ollama first
+    API_URL = OLLAMA_URL
+
 TEMPERATURE = float(os.getenv("TEMPERATURE", DEFAULT_TEMPERATURE))
 MAX_TOKENS = int(os.getenv("MAX_TOKENS", DEFAULT_MAX_TOKENS))
 BOT_NAME = os.getenv("BOT_NAME", "cooperbot")
@@ -102,6 +135,8 @@ bot = setup_discord_bot()
 async def ask_llm(user_input: str) -> str:
     """
     Send user input to LLM API and return the response.
+    Supports both local LLM (Ollama) and OpenAI ChatGPT APIs.
+    When using Ollama as primary, falls back to OpenAI if Ollama is unavailable.
 
     Args:
         user_input (str): The user's question or message
@@ -110,16 +145,100 @@ async def ask_llm(user_input: str) -> str:
         str: The LLM's response
 
     Raises:
-        aiohttp.ClientError: If API request fails
+        aiohttp.ClientError: If API request fails on all providers
         KeyError: If response format is unexpected
+        ValueError: If OpenAI API key is missing when needed
     """
     # Create secure connector with custom SSL context
     connector = aiohttp.TCPConnector(ssl=ssl_context)
 
     async with aiohttp.ClientSession(connector=connector) as session:
-        # Prepare API payload
+        # Try primary provider first
+        try:
+            return await _make_api_request(session, user_input, API_PROVIDER, API_URL, MODEL)
+        except (aiohttp.ClientError, asyncio.TimeoutError) as primary_error:
+            # If primary provider is Ollama and fails, try OpenAI fallback
+            if API_PROVIDER == API_PROVIDER_OLLAMA and ENABLE_FALLBACK and OPENAI_API_KEY:
+                print(f"Warning: Primary LLM API failed, trying OpenAI fallback...")
+                try:
+                    fallback_model = os.getenv("FALLBACK_MODEL", DEFAULT_OPENAI_MODEL)
+                    return await _make_api_request(session, user_input, API_PROVIDER_OPENAI, 
+                                                 OPENAI_URL, fallback_model)
+                except Exception as fallback_error:
+                    print(f"Error: Fallback API also failed ({fallback_error})")
+                    raise primary_error
+            else:
+                # Re-raise original error if no fallback available
+                raise primary_error
+
+
+async def _make_api_request(session: aiohttp.ClientSession, user_input: str, 
+                          provider: str, api_url: str, model: str) -> str:
+    """
+    Make an API request to the specified LLM provider.
+
+    Args:
+        session: aiohttp session
+        user_input: user's message
+        provider: API provider type ("ollama" or "openai")
+        api_url: API endpoint URL
+        model: model identifier
+
+    Returns:
+        str: The LLM's response content
+    """
+    # Prepare headers and payload based on API provider
+    headers = {"Content-Type": "application/json"}
+
+    if provider == API_PROVIDER_OPENAI:
+        # OpenAI API configuration
+        if not OPENAI_API_KEY:
+            raise ValueError("OPENAI_API_KEY is required when using OpenAI provider")
+
+        # Ensure proper authorization header format
+        headers["Authorization"] = f"Bearer {OPENAI_API_KEY.strip()}"
+
+        # Ensure temperature is within valid range (0.0 to 2.0)
+        openai_temperature = max(0.0, min(2.0, float(TEMPERATURE)))
+
+        # Ensure max_tokens is positive and reasonable (OpenAI has model-specific limits)
+        openai_max_tokens = max(1, min(4096, int(MAX_TOKENS)))
+
+        # Build messages array - ensure content is string and not empty
+        messages = []
+        system_content = str(SYSTEM_PROMPT).strip() if SYSTEM_PROMPT else ""
+        if system_content:
+            messages.append({"role": "system", "content": system_content})
+            print(f"Debug: System prompt length: {len(system_content)}")
+        else:
+            print("Debug: No system prompt provided")
+
+        user_content = str(user_input).strip()
+        if not user_content:
+            raise ValueError("User input cannot be empty")
+        messages.append({"role": "user", "content": user_content})
+        print(f"Debug: User content: '{user_content}' (length: {len(user_content)})")
+
+        # Validate model name for OpenAI
+        model_name = str(model).strip()
+        if not model_name:
+            model_name = "gpt-3.5-turbo"  # Default fallback
+
+        # Build payload according to current OpenAI API spec
         payload = {
-            "model": MODEL,
+            "model": model_name,
+            "messages": messages,
+            # "max_completion_tokens": openai_max_tokens,
+        }
+
+        # Validate payload
+        if not payload.get("messages") or len(payload["messages"]) == 0:
+            raise ValueError("Messages cannot be empty for OpenAI API")
+
+    else:
+        # Ollama/Local LLM API configuration
+        payload = {
+            "model": model,
             "messages": [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_input},
@@ -131,13 +250,28 @@ async def ask_llm(user_input: str) -> str:
             "stream": False,
         }
 
-        # Make API request
-        async with session.post(OLLAMA_URL, json=payload) as response:
-            response.raise_for_status()
-            data = await response.json()
+    # Set timeout based on provider type
+    timeout_duration = LOCAL_LLM_TIMEOUT if provider == API_PROVIDER_OLLAMA else REMOTE_API_TIMEOUT
+    timeout = aiohttp.ClientTimeout(total=timeout_duration)
 
-            # Extract and return response content
-            return data.get("message", {}).get("content", "").strip()
+    async with session.post(api_url, json=payload, headers=headers, timeout=timeout) as response:
+        if not response.ok:
+            # Get the error response for debugging
+            error_text = await response.text()
+            print(f"API Error ({response.status}): {error_text}")
+            response.raise_for_status()
+
+        data = await response.json()
+
+        # Extract response content based on API provider
+        if provider == API_PROVIDER_OPENAI:
+            response_content = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+            print(f"Debug: OpenAI response content: '{response_content}' (length: {len(response_content)})")
+            return response_content
+        else:
+            response_content = data.get("message", {}).get("content", "").strip()
+            print(f"Debug: Ollama response content: '{response_content}' (length: {len(response_content)})")
+            return response_content
 
 # =============================================================================
 # DISCORD EVENT HANDLERS
@@ -212,10 +346,19 @@ async def handle_question(message, question: str):
         try:
             # Get response from LLM
             reply = await ask_llm(question)
+            print(f"Debug: Raw LLM reply: '{reply}' (length: {len(reply)})")
+
+            # Ensure we have a valid response
+            if not reply or not reply.strip():
+                print("Warning: LLM returned empty response")
+                reply = "I'm sorry, I couldn't generate a response right now."
 
             # Truncate response if too long and send reply
             truncated_reply = reply[:MAX_RESPONSE_LENGTH]
-            await message.reply(truncated_reply)
+            if truncated_reply.strip():  # Final check before sending
+                await message.reply(truncated_reply)
+            else:
+                await message.reply("I'm having trouble responding right now. Please try again!")
 
         except Exception as e:
             # Log error and send user-friendly error message
@@ -231,6 +374,22 @@ def main():
     if not DISCORD_TOKEN:
         print("Error: DISCORD_TOKEN not found in environment variables")
         return
+
+    # Validate configuration based on API provider
+    if API_PROVIDER == API_PROVIDER_OPENAI and not OPENAI_API_KEY:
+        print("Error: OPENAI_API_KEY is required when API_PROVIDER is set to 'openai'")
+        return
+
+    print(f"Starting bot with {API_PROVIDER.upper()} API provider...")
+    print(f"Model: {MODEL}")
+
+    # Show fallback status
+    if API_PROVIDER == API_PROVIDER_OLLAMA and ENABLE_FALLBACK:
+        if OPENAI_API_KEY:
+            fallback_model = os.getenv("FALLBACK_MODEL", DEFAULT_OPENAI_MODEL)
+            print(f"OpenAI fallback enabled (model: {fallback_model})")
+        else:
+            print("Warning: Fallback enabled but OPENAI_API_KEY not set")
 
     # Start the bot
     bot.run(DISCORD_TOKEN)

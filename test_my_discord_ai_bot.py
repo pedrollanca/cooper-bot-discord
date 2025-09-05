@@ -11,6 +11,8 @@ import asyncio
 import os
 import tempfile
 import json
+
+import aiohttp
 from aiohttp import ClientResponseError
 
 # Import functions from my_discord_ai_bot (assuming they're importable)
@@ -128,8 +130,9 @@ class TestLLMIntegration(unittest.TestCase):
         }
 
     @patch('my_discord_ai_bot.aiohttp.ClientSession')
-    async def test_ask_llm_success(self, mock_session_class):
-        """Test successful LLM API request."""
+    @patch('my_discord_ai_bot.API_PROVIDER', 'ollama')
+    async def test_ask_llm_success_ollama(self, mock_session_class):
+        """Test successful LLM API request with Ollama provider."""
         # Mock the session and response
         mock_session = AsyncMock()
         mock_response = AsyncMock()
@@ -150,6 +153,129 @@ class TestLLMIntegration(unittest.TestCase):
 
         self.assertEqual(result, "This is a test response from the LLM")
         mock_session.post.assert_called_once()
+
+    @patch('my_discord_ai_bot.aiohttp.ClientSession')
+    @patch('my_discord_ai_bot.API_PROVIDER', 'openai')
+    @patch('my_discord_ai_bot.OPENAI_API_KEY', 'test-api-key')
+    async def test_ask_llm_success_openai(self, mock_session_class):
+        """Test successful LLM API request with OpenAI provider."""
+        # Mock OpenAI response format
+        openai_response_data = {
+            "choices": [
+                {
+                    "message": {
+                        "content": "This is a test response from OpenAI"
+                    }
+                }
+            ]
+        }
+
+        # Mock the session and response
+        mock_session = AsyncMock()
+        mock_response = AsyncMock()
+        mock_response.raise_for_status = AsyncMock()
+        mock_response.json = AsyncMock(return_value=openai_response_data)
+
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=None)
+        mock_session.post = AsyncMock()
+        mock_session.post.return_value.__aenter__ = AsyncMock(return_value=mock_response)
+        mock_session.post.return_value.__aexit__ = AsyncMock(return_value=None)
+
+        mock_session_class.return_value = mock_session
+
+        from my_discord_ai_bot import ask_llm
+
+        result = await ask_llm("Test question")
+
+        self.assertEqual(result, "This is a test response from OpenAI")
+        mock_session.post.assert_called_once()
+
+    @patch('my_discord_ai_bot.API_PROVIDER', 'openai')
+    @patch('my_discord_ai_bot.OPENAI_API_KEY', None)
+    async def test_ask_llm_openai_missing_key(self):
+        """Test OpenAI provider with missing API key."""
+        from my_discord_ai_bot import ask_llm
+
+        with self.assertRaises(ValueError) as context:
+            await ask_llm("Test question")
+
+        self.assertIn("OPENAI_API_KEY is required", str(context.exception))
+
+    @patch('my_discord_ai_bot.aiohttp.ClientSession')
+    @patch('my_discord_ai_bot.API_PROVIDER', 'ollama')
+    @patch('my_discord_ai_bot.ENABLE_FALLBACK', True)
+    @patch('my_discord_ai_bot.OPENAI_API_KEY', 'test-api-key')
+    @patch('os.getenv')
+    async def test_ask_llm_fallback_success(self, mock_getenv, mock_session_class):
+        """Test successful fallback from Ollama to OpenAI when Ollama fails."""
+        # Mock environment variable for fallback model
+        mock_getenv.return_value = 'gpt-3.5-turbo'
+
+        # Mock OpenAI response format for fallback
+        openai_response_data = {
+            "choices": [
+                {
+                    "message": {
+                        "content": "This is a fallback response from OpenAI"
+                    }
+                }
+            ]
+        }
+
+        mock_session = AsyncMock()
+        mock_response = AsyncMock()
+        mock_response.raise_for_status = AsyncMock()
+        mock_response.json = AsyncMock(return_value=openai_response_data)
+
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=None)
+
+        # First call fails (Ollama), second succeeds (OpenAI fallback)
+        mock_session.post = AsyncMock()
+        mock_session.post.return_value.__aenter__ = AsyncMock(
+            side_effect=[
+                AsyncMock(side_effect=aiohttp.ClientConnectorError(connection_key=None, os_error=None)),
+                mock_response
+            ]
+        )
+        mock_session.post.return_value.__aexit__ = AsyncMock(return_value=None)
+
+        mock_session_class.return_value = mock_session
+
+        from my_discord_ai_bot import ask_llm
+
+        result = await ask_llm("Test question")
+
+        self.assertEqual(result, "This is a fallback response from OpenAI")
+        # Should be called twice - once for Ollama (fails), once for OpenAI (succeeds)
+        self.assertEqual(mock_session.post.call_count, 2)
+
+    @patch('my_discord_ai_bot.aiohttp.ClientSession')
+    @patch('my_discord_ai_bot.API_PROVIDER', 'ollama')
+    @patch('my_discord_ai_bot.ENABLE_FALLBACK', False)
+    async def test_ask_llm_no_fallback_when_disabled(self, mock_session_class):
+        """Test that fallback doesn't occur when disabled."""
+        mock_session = AsyncMock()
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=None)
+
+        # Mock connection error
+        mock_session.post = AsyncMock()
+        mock_session.post.return_value.__aenter__ = AsyncMock(
+            side_effect=aiohttp.ClientConnectorError(connection_key=None, os_error=None)
+        )
+        mock_session.post.return_value.__aexit__ = AsyncMock(return_value=None)
+
+        mock_session_class.return_value = mock_session
+
+        from my_discord_ai_bot import ask_llm
+
+        with self.assertRaises(aiohttp.ClientConnectorError):
+            await ask_llm("Test question")
+
+        # Should only be called once (no fallback attempt)
+        self.assertEqual(mock_session.post.call_count, 1)
 
     @patch('my_discord_ai_bot.aiohttp.ClientSession')
     async def test_ask_llm_http_error(self, mock_session_class):
