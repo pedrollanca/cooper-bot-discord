@@ -1,0 +1,7 @@
+discord.py
+aiohttp
+python-dotenv
+certifi
+pytest
+pytest-asyncio
+pytest-mock
